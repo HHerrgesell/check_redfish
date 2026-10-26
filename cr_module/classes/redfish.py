@@ -63,6 +63,9 @@ class RedfishConnection:
         self.init_connection()
 
     def exit_on_error(self, message, level="UNKNOWN"):
+        # with --nosession the session would otherwise stay open on the BMC until it times out
+        if self.cli_args.nosession is True:
+            self.terminate_session()
         self.remove_session_lock()
         print(f"[{level}]: {message}")
         exit(plugin_status_types.get(level))
@@ -296,12 +299,15 @@ class RedfishConnection:
             self.connection._conn = None
             self.connection._conn_count = 0
 
+        # write to a temp file and rename it, so parallel checks never read a half written session file
+        session_file_tmp_path = f"{self.session_file_path}.{os.getpid()}.tmp"
+
         # create file handle file descriptor
         umask_original = os.umask(0o777 ^ self.desired_session_file_mode)
         session_file_handle = None
         try:
-            session_file_handle = os.open(self.session_file_path,
-                                          os.O_WRONLY | os.O_CREAT,
+            session_file_handle = os.open(session_file_tmp_path,
+                                          os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
                                           self.desired_session_file_mode)
 
         except PermissionError as e:
@@ -325,6 +331,7 @@ class RedfishConnection:
         if session_file_handle is not None:
             with os.fdopen(session_file_handle, 'wb') as pickled_session:
                 pickle.dump(self.connection, pickled_session)
+            os.replace(session_file_tmp_path, self.session_file_path)
 
         # set root attribute again
         self.connection.root = root_data
@@ -513,6 +520,50 @@ class RedfishConnection:
         except Exception:
             pass
 
+    def get_session_status(self):
+        """
+            Probe the own session resource (fallback: sessions collection) with the current token.
+            Returns the HTTP status or None if the request failed.
+        """
+
+        probe_path = "/redfish/v1/SessionService/Sessions/"
+        try:
+            session_location = self.connection.get_session_location()
+            if session_location:
+                probe_path = urlparse(session_location).path
+        except Exception:
+            pass
+
+        try:
+            return self.connection.get(probe_path, None).status
+        except Exception:
+            return None
+
+    def renew_session_if_invalid(self):
+        """
+            Called after an error response for a restored session. A resource error
+            (e.g. HTTP 500 on a single NetworkAdapter) must not cause a new login, as the old
+            session would stay open on the BMC until it times out. Returns True if a new session was created.
+        """
+
+        if self.session_was_restored is False:
+            return False
+
+        # renew at most once per run
+        self.session_was_restored = False
+
+        session_status = self.get_session_status()
+        if session_status == 200:
+            return False
+
+        # session still known to the BMC but unusable -> log out before creating a new one
+        if session_status is not None and session_status != 401:
+            self.terminate_session()
+
+        self.init_connection(reset=True)
+
+        return True
+
     def _rf_get(self, redfish_path):
 
         try:
@@ -534,9 +585,7 @@ class RedfishConnection:
 
             if (redfish_response.status is None or
                 (redfish_response.status != 404 and redfish_response.status >= 400)) \
-                    and self.session_was_restored is True:
-                # reset connection
-                self.init_connection(reset=True)
+                    and self.renew_session_if_invalid() is True:
 
                 # query again
                 redfish_response = self._rf_get(redfish_path)
@@ -628,9 +677,8 @@ class RedfishConnection:
             redfish_response = self._rf_post("/redfish/v1/Views/", self.vendor_data.view_select)
 
             # session invalid
-            if redfish_response.status != 404 and redfish_response.status >= 400 and self.session_was_restored is True:
-                # reset connection
-                self.init_connection(reset=True)
+            if redfish_response.status != 404 and redfish_response.status >= 400 and \
+                    self.renew_session_if_invalid() is True:
 
                 # query again
                 redfish_response = self._rf_post("/redfish/v1/Views/", self.vendor_data.view_select)
