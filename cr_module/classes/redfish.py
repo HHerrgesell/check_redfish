@@ -357,10 +357,8 @@ class RedfishConnection:
         except:
             return False
 
-    def login_with_redirect_handling(self):
-        """Perform Redfish session login with HTTP redirect support using direct HTTP requests."""
-
-        base_url = f"https://{self.cli_args.host}"
+    def get_sessions_path(self):
+        """Return the path of the sessions collection."""
 
         # Use the sessions collection advertised by the service root
         # (Links.Sessions). Older BMCs do not serve it at the default path,
@@ -373,7 +371,15 @@ class RedfishConnection:
                 sessions_path = advertised
         except (AttributeError, KeyError, TypeError):
             pass
-        sessions_url = f"{base_url}{sessions_path}"
+
+        return sessions_path
+
+    def login_with_redirect_handling(self):
+        """Perform Redfish session login with HTTP redirect support using direct HTTP requests."""
+
+        base_url = f"https://{self.cli_args.host}"
+
+        sessions_url = f"{base_url}{self.get_sessions_path()}"
 
         login_payload = {
             "UserName": self.username,
@@ -526,7 +532,7 @@ class RedfishConnection:
             Returns the HTTP status or None if the request failed.
         """
 
-        probe_path = "/redfish/v1/SessionService/Sessions/"
+        probe_path = self.get_sessions_path()
         try:
             session_location = self.connection.get_session_location()
             if session_location:
